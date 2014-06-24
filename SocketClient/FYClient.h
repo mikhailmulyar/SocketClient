@@ -123,6 +123,12 @@ typedef void(^FYMessageCallback)(NSDictionary *userInfo);
  */
 @property (nonatomic, assign) BOOL awaitOnlyHandshake;
 
+
+/**
+Time out interval for connection
+*/
+@property (nonatomic, assign) NSTimeInterval timeoutInterval;
+
 /**
  Check if client is connected
  */

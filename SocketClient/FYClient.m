@@ -42,6 +42,7 @@
 
 const NSTimeInterval FYClientRetryTimeInterval     = 45;
 const NSTimeInterval FYClientReconnectTimeInterval = 45;
+const NSTimeInterval FYClientServerReconnectTimeInterval = 25;
 
 NSString *const FYWorkerQueueName = @"com.paij.SocketClient.FYClient";
 
@@ -376,6 +377,7 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 #pragma mark - Public connection status methods
 
 - (void)connect {
+	FYLog(@"Faye connecting to: %@", self.baseURL.absoluteString);
     [self connectWithExtension:nil];
 }
 
@@ -437,7 +439,10 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 }
 
 - (void)disconnect {
-    self.reconnecting = NO;
+
+	[NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(timeoutCallback) object:nil];
+
+	self.reconnecting = NO;
     self.persist = nil;
     self.state = FYClientStateDisconnecting;
     if (self.clientId) {
@@ -449,23 +454,42 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
             }
          }];
     }
+
+	self.webSocket.delegate = nil;
+	[self.webSocket close];
 }
 
 - (void)reconnect {
-    // Save current channels
-    NSMutableDictionary *channels = self.channels.mutableCopy;
-    [self connectWithExtension:self.connectionExtension onSuccess:self.isReconnecting ? nil : ^(FYClient *self) {
-        if (self.state >= FYClientStateConnecting) {
-            // Re-subscript to channels on server-side
-            self.channels = channels;
-            for (NSString *channel in channels) {
-                // Send subscribe directly, without unboxing and re-boxing FYMessageCallbacks
-                [self sendSubscribe:channel withExtension:[channels[channel] extension]];
-            }
-        }
-        self.reconnecting = NO;
-     }];
-    self.reconnecting = YES;
+
+	if (self.reconnecting)
+		return;
+
+	// Save current channels
+	NSMutableDictionary *channels = self.channels.mutableCopy;
+	[self connectWithExtension:self.connectionExtension onSuccess:self.isReconnecting ? nil : ^(FYClient *client)
+	{
+		if (self.state >= FYClientStateConnecting)
+		{
+			// Re-subscript to channels on server-side
+			self.channels = channels;
+			for (NSString *channel in channels)
+			{
+				// Send subscribe directly, without unboxing and re-boxing FYMessageCallbacks
+				[self sendSubscribe:channel withExtension:[channels[channel] extension]];
+			}
+		}
+		self.reconnecting = NO;
+	}];
+	self.reconnecting = YES;
+
+	__weak __typeof (self) weakSelf = self;
+	dispatch_time_t runTime = dispatch_time (DISPATCH_TIME_NOW, 10.0f * NSEC_PER_SEC);
+	dispatch_after (runTime, dispatch_get_main_queue(), ^{
+
+		__strong __typeof (weakSelf) strongSelf = weakSelf;
+
+		strongSelf.reconnecting = NO;
+	});
 }
 
 - (BOOL)isConnected {
@@ -493,7 +517,10 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
     FYLog(@"Scheduled a keep-alive connect in %.3f.", self.retryTimeInterval);
     if (self.retryTimeInterval > 0) {
         // Schedule the next keep-alive connect.
-        [self performBlock:^(FYClient *client) {
+
+		[self performSelectorOnMainThread:@selector(timeoutCallbackOnMainThread) withObject:nil waitUntilDone:NO];
+
+		[self performBlock:^(FYClient *client) {
             // Check if the client is still connected, or if we may received an advice, which caused a handshake or
             // a disconnect. So we prevent unnecessary connect messages and especially connect message without
             // clientIds which would cause an exception.
@@ -503,6 +530,19 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
             }
         } afterDelay:self.retryTimeInterval];
     }
+}
+
+- (void)timeoutCallbackOnMainThread
+{
+	FYLog(@"Scheduled a timeout callback in %.3f.", self.retryTimeInterval + self.timeoutInterval + FYClientServerReconnectTimeInterval);
+
+	[NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(timeoutCallback) object:nil];
+	[self performSelector:@selector(timeoutCallback) withObject:nil afterDelay:self.retryTimeInterval + self.timeoutInterval + FYClientServerReconnectTimeInterval];
+}
+
+- (void)timeoutCallback {
+
+	[self webSocket:self.webSocket didFailWithError:[NSError errorWithDomain:NSPOSIXErrorDomain code:ETIMEDOUT userInfo:nil]];
 }
 
 
@@ -583,7 +623,13 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
     [self.webSocket close];
     
     // Init a new socket
-    self.webSocket = [[SRWebSocket alloc] initWithURLRequest:[NSURLRequest requestWithURL:self.baseURL]];
+
+	NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:self.baseURL];
+
+	if (self.timeoutInterval > 0)
+		request.timeoutInterval = self.timeoutInterval;
+
+    self.webSocket = [[SRWebSocket alloc] initWithURLRequest:request];
     self.webSocket.delegate = self;
     
     // Let's respond the socket on our workerQueue, we will dispatch on our delegate / callback queues for our own.
@@ -625,13 +671,18 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 #pragma mark - SRWebSocketDelegate's implementation
 
 - (void)webSocketDidOpen:(SRWebSocket *)aWebSocket {
-    if (self.maySendHandshakeAsync) {
+
+	FYLog(@"Web socket did open");
+
+	if (self.maySendHandshakeAsync) {
         // Handshake was already sent.
         if (self.state == FYClientStateConnecting) {
             self.state = FYClientStateConnected;
             
             // Successful response to handshake was already received, but socket was not open, so we must schedule the
             // first connect here.
+			[self sendConnect];
+
             [self scheduleKeepAlive];
             
             [self.clientDelegateProxy clientConnected:self];
@@ -642,11 +693,17 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 }
 
 - (void)webSocket:(SRWebSocket *)webSocket didReceiveMessage:(NSString *)message {
-    [self handleResponse:message];
+
+	FYLog(@"Web socket did receive message %@", message);
+
+	[self handleResponse:message];
 }
 
 - (void)webSocket:(SRWebSocket *)webSocket didCloseWithCode:(NSInteger)code reason:(NSString *)reason wasClean:(BOOL)wasClean {
-    if (self.state == FYClientStateDisconnected) {
+
+	FYLog(@"Web socket did close with reason %@", reason);
+
+	if (self.state == FYClientStateDisconnected) {
         // Filter out expected disconnects
         return;
     }
@@ -664,7 +721,10 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 }
 
 - (void)webSocket:(SRWebSocket *)webSocket didFailWithError:(NSError *)error {
-    if ([error.domain isEqualToString:NSPOSIXErrorDomain]) {
+
+	FYLog(@"Web socket did fail with error %@", error.localizedDescription);
+
+	if ([error.domain isEqualToString:NSPOSIXErrorDomain]) {
         [self handlePOSIXError:error];
     }
     [self.clientDelegateProxy client:self failedWithError:error];
@@ -839,6 +899,10 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 }
 
 - (void)sendDisconnect {
+
+	if (!self.clientId)
+		return;
+
     [self sendSocketMessage:@{
         @"channel":        FYMetaChannels.Disconnect,
         @"clientId":       self.clientId,
@@ -846,6 +910,10 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 }
 
 - (void)sendSubscribe:(id)channel withExtension:(NSDictionary *)extension {
+
+	if (!self.clientId)
+		return;
+
     [self sendSocketMessage:@{
         @"channel":      FYMetaChannels.Subscribe,
         @"clientId":     self.clientId,
@@ -855,6 +923,10 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 }
 
 - (void)sendUnsubscribe:(id)channel {
+
+	if (!self.clientId)
+		return;
+
     [self sendSocketMessage:@{
         @"channel":      FYMetaChannels.Unsubscribe,
         @"clientId":     self.clientId,
@@ -863,6 +935,10 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
 }
 
 - (void)sendPublish:(NSDictionary *)userInfo onChannel:(NSString *)channel withExtension:(NSDictionary *)extension {
+
+	if (!self.clientId)
+		return;
+
     [self sendSocketMessage:@{
         @"channel":  channel,
         @"clientId": self.clientId,
@@ -1025,6 +1101,9 @@ FYDefineDelegateProxy(SRWebSocketDelegate);
                 // Schedule the first keep-alive connect.
                 // DON'T send this immediately. This would cause (at least with Faye 0.8.9) an exceeding of the retry
                 // interval, which will cause a timeout/disconnet.
+
+				[self sendConnect];
+
                 [self scheduleKeepAlive];
             }
         } else {
