@@ -46,6 +46,26 @@ const NSTimeInterval FYClientServerReconnectTimeInterval = 25;
 
 NSString *const FYWorkerQueueName = @"com.paij.SocketClient.FYClient";
 
+/**
+ Bayeux protocol meta channels
+ */
+const struct FYMetaChannels {
+    __unsafe_unretained NSString *Handshake;
+    __unsafe_unretained NSString *Connect;
+    __unsafe_unretained NSString *Disconnect;
+    __unsafe_unretained NSString *Subscribe;
+    __unsafe_unretained NSString *Unsubscribe;
+} FYMetaChannels;
+
+/**
+ Relevant Bayeux connection types
+ */
+const struct FYConnectionTypes {
+    __unsafe_unretained NSString *LongPolling;      // Fallback - should be implemented, is actually not
+    __unsafe_unretained NSString *CallbackPolling;  // Not implemented
+    __unsafe_unretained NSString *WebSocket;        // Implemented
+} FYConnectionTypes;
+
 const struct FYMetaChannels FYMetaChannels = {
     .Handshake   = @"/meta/handshake",
     .Connect     = @"/meta/connect",
